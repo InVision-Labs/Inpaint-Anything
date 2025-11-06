@@ -16,6 +16,12 @@ pretrained_models/big-lama
 # pytracking/pretrain/
 *.pth
 
+
+inpainted/
+inpainted.png
+remove.py
+scenes/
+env/
 results/*
 
 

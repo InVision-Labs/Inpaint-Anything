@@ -28,17 +28,17 @@ def setup_args(parser):
         help="Path to the directory with source images",
     )
     parser.add_argument(
-        "--coords_type", type=str, required=True,
+        "--coords_type", type=str,
         default="key_in", choices=["click", "key_in"], 
-        help="The way to select coords",
+        help="The way to select coords (ignored when using precomputed masks)",
     )
     parser.add_argument(
-        "--point_coords", type=float, nargs='+', required=True,
-        help="The coordinate of the point prompt, [coord_W coord_H].",
+        "--point_coords", type=float, nargs='+', default=None,
+        help="The coordinate of the point prompt, [coord_W coord_H] (not needed with precomputed masks).",
     )
     parser.add_argument(
-        "--point_labels", type=int, default=1, nargs='+', required=True,
-        help="The labels of the point prompt, 1 or 0.",
+        "--point_labels", type=int, default=1, nargs='+',
+        help="The labels of the point prompt, 1 or 0 (not needed with precomputed masks).",
     )
     parser.add_argument(
         "--dilate_kernel_size", type=int, default=15,
@@ -51,11 +51,10 @@ def setup_args(parser):
     parser.add_argument(
         "--sam_model_type", type=str,
         default="vit_h", choices=['vit_h', 'vit_l', 'vit_b', 'vit_t'],
-        help="The type of sam model to load. Default: 'vit_h"
-    )
+        help="The type of sam model to load. Ignored with precomputed masks.")
     parser.add_argument(
-        "--sam_ckpt", type=str, required=True,
-        help="The path to the SAM checkpoint to use for mask generation.",
+        "--sam_ckpt", type=str,
+        help="The path to the SAM checkpoint (not needed with precomputed masks).",
     )
     parser.add_argument(
         "--lama_config", type=str,
@@ -68,8 +67,16 @@ def setup_args(parser):
         help="The path to the lama checkpoint.",
     )
     parser.add_argument(
-        "--tracker_ckpt", type=str, required=True,
-        help="The path to tracker checkpoint.",
+        "--masks_root", type=str, default=None,
+        help="Root directory containing precomputed masks (e.g., sam2_tracks)",
+    )
+    parser.add_argument(
+        "--object_id", type=str, default=None,
+        help="Object folder name to remove (e.g., obj_003) when using precomputed masks",
+    )
+    parser.add_argument(
+        "--tracker_ckpt", type=str,
+        help="The path to tracker checkpoint (not needed with precomputed masks).",
     )
     parser.add_argument(
         "--mask_idx", type=int, default=1, required=True,
@@ -272,6 +279,13 @@ class RemoveAnything3D(nn.Module):
             inpainter_target="lama",
     ):
         super().__init__()
+        self.args = args
+        self.use_precomputed_masks = (
+            getattr(args, "masks_root", None) is not None
+            and getattr(args, "object_id", None) is not None
+        )
+        self.masks_root = args.masks_root
+        self.object_id = args.object_id
         tracker_build_args = {
             "tracker_param": args.tracker_ckpt
         }
@@ -283,11 +297,11 @@ class RemoveAnything3D(nn.Module):
                 "config_p": args.lama_config,
                 "ckpt_p": args.lama_ckpt
         }
-
-        self.tracker = self.build_tracker(
-            tracker_target, **tracker_build_args)
-        self.segmentor = self.build_segmentor(
-            segmentor_target, **segmentor_build_args)
+        if not self.use_precomputed_masks:
+            self.tracker = self.build_tracker(
+                tracker_target, **tracker_build_args)
+            self.segmentor = self.build_segmentor(
+                segmentor_target, **segmentor_build_args)
         self.inpainter = self.build_inpainter(
             inpainter_target, **inpainter_build_args)
         self.tracker_target = tracker_target
@@ -374,53 +388,69 @@ class RemoveAnything3D(nn.Module):
         Mask is 0-1 ndarray in default
         """
         assert key_image_idx == 0, "Only support key image at the beginning."
+        if self.use_precomputed_masks:
+            all_image = [iio.imread(p) for p in image_ps]
+            masks_root = self.masks_root
+            object_id = self.object_id
 
-        # get key-image mask
-        key_image_p = image_ps[key_image_idx]
-        key_image = iio.imread(key_image_p)
-        key_masks, key_scores = self.forward_segmentor(
-            key_image, key_image_point_coords, key_image_point_labels)
-
-        # key-image mask selection
-        if key_image_mask_idx is not None:
-            key_mask = key_masks[key_image_mask_idx]
+            all_mask = []
+            for image_p in image_ps:
+                mask_p = os.path.join(masks_root, object_id, f"{Path(image_p).stem}.png")
+                mask = iio.imread(mask_p)
+                if dilate_kernel_size is not None:
+                    mask = dilate_mask(mask, dilate_kernel_size)
+                all_mask.append(mask)
+            print("Inpainting ...")
+            all_image = self.forward_inpainter(all_image, all_mask)
+            # boxes are not used in this branch
+            return all_image, all_mask, None
         else:
-            key_mask = self.mask_selection(key_masks, key_scores)
-        
-        if dilate_kernel_size is not None:
-            key_mask = dilate_mask(key_mask, dilate_kernel_size)
+            # get key-image mask
+            key_image_p = image_ps[key_image_idx]
+            key_image = iio.imread(key_image_p)
+            key_masks, key_scores = self.forward_segmentor(
+                key_image, key_image_point_coords, key_image_point_labels)
 
-        # get key-image box
-        key_box = self.get_box_from_mask(key_mask)
-
-        # get all-image boxes using tracker
-        print("Tracking ...")
-        all_box = self.forward_tracker(image_ps, key_box)
-
-        # get all-image masks using sam
-        print("Segmenting ...")
-        all_mask = [key_mask]
-        all_image = [key_image]
-        ref_mask = key_mask
-        for image_p, box in zip(image_ps[1:], all_box[1:]):
-            image = iio.imread(image_p)
-
-            # XYWH -> XYXY
-            x, y, w, h = box
-            sam_box = np.array([x, y, x + w, y + h])
-            masks, scores = self.forward_segmentor(image, box=sam_box)
-            mask = self.mask_selection(masks, scores, ref_mask)
+            # key-image mask selection
+            if key_image_mask_idx is not None:
+                key_mask = key_masks[key_image_mask_idx]
+            else:
+                key_mask = self.mask_selection(key_masks, key_scores)
+            
             if dilate_kernel_size is not None:
-                mask = dilate_mask(mask, dilate_kernel_size)
+                key_mask = dilate_mask(key_mask, dilate_kernel_size)
 
-            ref_mask = mask
-            all_mask.append(mask)
-            all_image.append(image)
+            # get key-image box
+            key_box = self.get_box_from_mask(key_mask)
 
-        # get all-image inpainted results
-        print("Inpainting ...")
-        all_image = self.forward_inpainter(all_image, all_mask)
-        return all_image, all_mask, all_box
+            # get all-image boxes using tracker
+            print("Tracking ...")
+            all_box = self.forward_tracker(image_ps, key_box)
+
+            # get all-image masks using sam
+            print("Segmenting ...")
+            all_mask = [key_mask]
+            all_image = [key_image]
+            ref_mask = key_mask
+            for image_p, box in zip(image_ps[1:], all_box[1:]):
+                image = iio.imread(image_p)
+
+                # XYWH -> XYXY
+                x, y, w, h = box
+                sam_box = np.array([x, y, x + w, y + h])
+                masks, scores = self.forward_segmentor(image, box=sam_box)
+                mask = self.mask_selection(masks, scores, ref_mask)
+                if dilate_kernel_size is not None:
+                    mask = dilate_mask(mask, dilate_kernel_size)
+
+                ref_mask = mask
+                all_mask.append(mask)
+                all_image.append(image)
+
+            # get all-image inpainted results
+            print("Inpainting ...")
+            all_image = self.forward_inpainter(all_image, all_mask)
+            return all_image, all_mask, all_box
     
 def mkstemp(suffix, dir=None):
     fd, path = tempfile.mkstemp(suffix=f"{suffix}", dir=dir)
@@ -497,35 +527,70 @@ if __name__ == "__main__":
     key_image_mask_idx = args.mask_idx
     images_raw_dir = args.input_dir
     factor = args.factor
+    use_precomputed = (args.masks_root is not None and args.object_id is not None)
 
     images_raw_dir = Path(f"{images_raw_dir}")
-    removed_dir = images_raw_dir / f"images_remove_{factor}"
-    image_mask_dir = removed_dir / f"mask_{dilate_kernel_size}" #存mask images
-    images_rm_w_mask_dir = removed_dir / f"removed_with_mask_{dilate_kernel_size}" #removed images
-    images_w_mask_dir = removed_dir / f"w_mask_{dilate_kernel_size}"
-    images_w_box_dir = removed_dir / f"w_box_{dilate_kernel_size}"
-    removed_dir.mkdir(exist_ok=True, parents=True)
-    image_mask_dir.mkdir(exist_ok=True, parents=True)
-    images_rm_w_mask_dir.mkdir(exist_ok=True, parents=True)
-    images_w_mask_dir.mkdir(exist_ok=True, parents=True)
-    images_w_box_dir.mkdir(exist_ok=True, parents=True)
+    use_precomputed = (args.masks_root is not None and args.object_id is not None)
+    if use_precomputed:
+        out_dir = Path(args.input_dir) / f"scene_without_{args.object_id}"
+        out_dir.mkdir(exist_ok=True, parents=True)
+        # Also create LLFF-expected structure for NeRF loader
+        removed_dir = images_raw_dir / f"images_remove_{factor}"
+        images_rm_w_mask_dir = removed_dir / f"removed_with_mask_{dilate_kernel_size}"
+        removed_dir.mkdir(exist_ok=True, parents=True)
+        images_rm_w_mask_dir.mkdir(exist_ok=True, parents=True)
+    else:
+        removed_dir = images_raw_dir / f"images_remove_{factor}"
+        image_mask_dir = removed_dir / f"mask_{dilate_kernel_size}"
+        images_rm_w_mask_dir = removed_dir / f"removed_with_mask_{dilate_kernel_size}"
+        images_w_mask_dir = removed_dir / f"w_mask_{dilate_kernel_size}"
+        images_w_box_dir = removed_dir / f"w_box_{dilate_kernel_size}"
+        removed_dir.mkdir(exist_ok=True, parents=True)
+        image_mask_dir.mkdir(exist_ok=True, parents=True)
+        images_rm_w_mask_dir.mkdir(exist_ok=True, parents=True)
+        images_w_mask_dir.mkdir(exist_ok=True, parents=True)
+        images_w_box_dir.mkdir(exist_ok=True, parents=True)
 
 
     #load source multi-view images
     image_ps =[]
     assert Path(images_raw_dir).exists()
     if args.factor is not None:
-        images_raw_dir = os.path.join(images_raw_dir,'images'+'_{}'.format(factor))
+        images_raw_dir_candidate = os.path.join(images_raw_dir,'images'+'_{}'.format(factor))
     else:
-        images_raw_dir = os.path.join(images_raw_dir,'images')
-    image_ps = sorted(glob.glob(os.path.join(images_raw_dir,'*.png')))
+        images_raw_dir_candidate = os.path.join(images_raw_dir,'images')
+    # Fallback to base images if minified directory doesn't exist yet
+    if not os.path.exists(images_raw_dir_candidate):
+        images_raw_dir_candidate = os.path.join(args.input_dir, 'images')
+    images_raw_dir = images_raw_dir_candidate
+    # Support both png and jpg inputs
+    image_ps = []
+    for ext in ['*.png', '*.jpg', '*.jpeg', '*.JPG', '*.PNG']:
+        image_ps.extend(glob.glob(os.path.join(images_raw_dir, ext)))
+    image_ps = sorted(image_ps)
 
-    point_labels = np.array(args.point_labels)
-    if args.coords_type == "click":
-        point_coords = get_clicked_point(image_ps[0])
-    elif args.coords_type == "key_in":
-        point_coords = args.point_coords
-    point_coords = np.array([point_coords])
+    if use_precomputed:
+        # Dummy values; not used in precomputed-mask mode
+        point_labels = np.array([1])
+        point_coords = np.array([[0, 0]])
+    else:
+        # Validate interactive parameters
+        if args.coords_type is None:
+            raise ValueError("--coords_type is required unless using precomputed masks (--masks_root and --object_id)")
+        if args.coords_type == "click":
+            point_coords = get_clicked_point(image_ps[0])
+            point_labels = np.array(args.point_labels if args.point_labels is not None else [1])
+            point_coords = np.array([point_coords])
+        elif args.coords_type == "key_in":
+            if args.point_coords is None:
+                raise ValueError("--point_coords is required when --coords_type=key_in")
+            if args.point_labels is None:
+                raise ValueError("--point_labels is required when --coords_type=key_in")
+            point_coords = np.array([args.point_coords])
+            point_labels = np.array(args.point_labels)
+        # Ensure SAM/tracker are provided when not using precomputed masks
+        if args.sam_ckpt is None or args.tracker_ckpt is None:
+            raise ValueError("--sam_ckpt and --tracker_ckpt are required unless using precomputed masks")
 
     #remove object from source images 
     # device = "cuda:4" if torch.cuda.is_available() else "cpu"
@@ -537,29 +602,32 @@ if __name__ == "__main__":
             dilate_kernel_size
         )
 
-    #save removed images
-    for i in range(len(all_images_rm_w_mask)):
-        all_images_rm_w_mask_p = images_rm_w_mask_dir / f"{Path(image_ps[i]).stem}.png"
-        # images_raw_p = images_raw_dir / f"{Path(image_ps[i]).stem}.png"
-        save_array_to_img(all_images_rm_w_mask[i], all_images_rm_w_mask_p)
-        # save_array_to_img(all_images_rm_w_mask[i], images_raw_p)
-    #save the mask
-    all_mask = [np.uint8(mask * 255) for mask in all_mask]
-    for i in range(len(all_mask)):
-        all_mask_p = image_mask_dir / f"{Path(image_ps[i]).stem}.png"
-        save_array_to_img(all_mask[i], all_mask_p)
-    #save the source images with mask
-    images_w_mask = []
-    for i in range(len(all_mask)):
-        images_w_mask.append(show_img_with_mask(iio.imread(image_ps[i]), all_mask[i]))
-        images_w_mask_p = images_w_mask_dir / f"{Path(image_ps[i]).stem}.png"
-        save_array_to_img(images_w_mask[i], images_w_mask_p)
-    #save the source images with box
-    images_w_box = []
-    for i in range(len(all_box)):
-        images_w_box.append(show_img_with_box(iio.imread(image_ps[i]), all_box[i]))
-        images_w_box_p = images_w_box_dir / f"{Path(image_ps[i]).stem}.png"
-        save_array_to_img(images_w_box[i], images_w_box_p)
+    if use_precomputed:
+        for i in range(len(all_images_rm_w_mask)):
+            # Save to scene_without_<object_id>
+            out_p = out_dir / f"{Path(image_ps[i]).stem}.png"
+            save_array_to_img(all_images_rm_w_mask[i], out_p)
+            # Also save to LLFF-expected removed_with_mask_{k}
+            llff_p = images_rm_w_mask_dir / f"{Path(image_ps[i]).stem}.png"
+            save_array_to_img(all_images_rm_w_mask[i], llff_p)
+    else:
+        for i in range(len(all_images_rm_w_mask)):
+            all_images_rm_w_mask_p = images_rm_w_mask_dir / f"{Path(image_ps[i]).stem}.png"
+            save_array_to_img(all_images_rm_w_mask[i], all_images_rm_w_mask_p)
+        all_mask = [np.uint8(mask * 255) for mask in all_mask]
+        for i in range(len(all_mask)):
+            all_mask_p = image_mask_dir / f"{Path(image_ps[i]).stem}.png"
+            save_array_to_img(all_mask[i], all_mask_p)
+        images_w_mask = []
+        for i in range(len(all_mask)):
+            images_w_mask.append(show_img_with_mask(iio.imread(image_ps[i]), all_mask[i]))
+            images_w_mask_p = images_w_mask_dir / f"{Path(image_ps[i]).stem}.png"
+            save_array_to_img(images_w_mask[i], images_w_mask_p)
+        images_w_box = []
+        for i in range(len(all_box)):
+            images_w_box.append(show_img_with_box(iio.imread(image_ps[i]), all_box[i]))
+            images_w_box_p = images_w_box_dir / f"{Path(image_ps[i]).stem}.png"
+            save_array_to_img(images_w_box[i], images_w_box_p)
 
     #novel view synthesis with removed images
     train(args)
